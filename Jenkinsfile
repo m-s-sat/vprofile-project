@@ -1,121 +1,91 @@
-pipeline {
-    
-	agent any
-/*	
-	tools {
-        maven "maven3"
+pipeline{
+    agent any
+    tools{
+        maven 'mvn3.9'
+        jdk 'JDK17'
     }
-*/	
-    environment {
-        NEXUS_VERSION = "nexus3"
-        NEXUS_PROTOCOL = "http"
-        NEXUS_URL = "172.31.40.209:8081"
-        NEXUS_REPOSITORY = "vprofile-release"
-	NEXUS_REPO_ID    = "vprofile-release"
-        NEXUS_CREDENTIAL_ID = "nexuslogin"
-        ARTVERSION = "${env.BUILD_ID}"
+    environment{
+        registryCredential = 'ecr:us-east-1:awscreds_practice'
+        imageName = '045712586082.dkr.ecr.us-east-1.amazonaws.com/vprofile-practice'
+        vprofileRegistry = 'http://045712586082.dkr.ecr.us-east-1.amazonaws.com'
+        cluster = 'vprofile-practice'
+        service = 'vprofile-practice-svc'
     }
-	
     stages{
-        
-        stage('BUILD'){
-            steps {
-                sh 'mvn clean install -DskipTests'
+        stage("Fetch the code"){
+            steps{
+                git branch:'docker', url:'https://github.com/m-s-sat/vprofile-project.git'
             }
-            post {
-                success {
-                    echo 'Now Archiving...'
+        }
+        stage('Build the code'){
+            steps{
+                sh 'mvn install -DskipTests'
+            }
+            post{
+                success{
                     archiveArtifacts artifacts: '**/target/*.war'
                 }
             }
         }
-
-	stage('UNIT TEST'){
-            steps {
+        stage('Test the code'){
+            steps{
                 sh 'mvn test'
             }
         }
-
-	stage('INTEGRATION TEST'){
-            steps {
-                sh 'mvn verify -DskipUnitTests'
-            }
-        }
-		
-        stage ('CODE ANALYSIS WITH CHECKSTYLE'){
-            steps {
+        stage('Checkstyle'){
+            steps{
                 sh 'mvn checkstyle:checkstyle'
             }
-            post {
-                success {
-                    echo 'Generated Analysis Result'
+        }
+        stage('Code Analysis'){
+            environment{
+                scannerHome = tool 'sonar6.2'
+            }
+            steps{
+                withSonarQubeEnv("sonarscanner"){
+                    sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
+                    -Dsonar.projectName=vprofile \
+                    -Dsonar.projectVersion=1.0 \
+                    -Dsonar.sources=src/ \
+                    -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+                    -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                    -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                    -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
                 }
             }
         }
-
-        stage('CODE ANALYSIS with SONARQUBE') {
-          
-		  environment {
-             scannerHome = tool 'sonarscanner4'
-          }
-
-          steps {
-            withSonarQubeEnv('sonar-pro') {
-               sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
-                   -Dsonar.projectName=vprofile-repo \
-                   -Dsonar.projectVersion=1.0 \
-                   -Dsonar.sources=src/ \
-                   -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
-                   -Dsonar.junit.reportsPath=target/surefire-reports/ \
-                   -Dsonar.jacoco.reportsPath=target/jacoco.exec \
-                   -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+        stage('Quality Gate'){
+            steps{
+                timeout(time:1, unit:'HOURS'){
+                    waitForQualityGate abortPipeline: true
+                }
             }
-
-            timeout(time: 10, unit: 'MINUTES') {
-               waitForQualityGate abortPipeline: true
-            }
-          }
         }
-
-        stage("Publish to Nexus Repository Manager") {
-            steps {
-                script {
-                    pom = readMavenPom file: "pom.xml";
-                    filesByGlob = findFiles(glob: "target/*.${pom.packaging}");
-                    echo "${filesByGlob[0].name} ${filesByGlob[0].path} ${filesByGlob[0].directory} ${filesByGlob[0].length} ${filesByGlob[0].lastModified}"
-                    artifactPath = filesByGlob[0].path;
-                    artifactExists = fileExists artifactPath;
-                    if(artifactExists) {
-                        echo "*** File: ${artifactPath}, group: ${pom.groupId}, packaging: ${pom.packaging}, version ${pom.version} ARTVERSION";
-                        nexusArtifactUploader(
-                            nexusVersion: NEXUS_VERSION,
-                            protocol: NEXUS_PROTOCOL,
-                            nexusUrl: NEXUS_URL,
-                            groupId: pom.groupId,
-                            version: ARTVERSION,
-                            repository: NEXUS_REPOSITORY,
-                            credentialsId: NEXUS_CREDENTIAL_ID,
-                            artifacts: [
-                                [artifactId: pom.artifactId,
-                                classifier: '',
-                                file: artifactPath,
-                                type: pom.packaging],
-                                [artifactId: pom.artifactId,
-                                classifier: '',
-                                file: "pom.xml",
-                                type: "pom"]
-                            ]
-                        );
-                    } 
-		    else {
-                        error "*** File: ${artifactPath}, could not be found";
+        stage("Build Docker Image"){
+            steps{
+                script{
+                    dockerImage = docker.build(imageName + ":$BUILD_NUMBER", "./Docker-files/app/multistage/")
+                }
+            }
+        }
+        stage("Upload App image"){
+            steps{
+                script{
+                    docker.withRegistry(vprofileRegistry, registryCredential){
+                        dockerImage.push("$BUILD_NUMBER")
+                        dockerImage.push("latest")
                     }
                 }
             }
         }
-
-
+        stage("Upload to ecs"){
+            steps{
+                script{
+                    withAWS(credentials:'awscreds_practice',region:'us-east-1'){
+                        sh 'aws ecs update-service --cluster ${cluster} --service ${service} --force-new-deployment'
+                    }
+                }
+            }
+        }
     }
-
-
 }
